@@ -454,6 +454,49 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
         paperSize: '${printPaperSize}'
       }));
     };
+
+    // Many receipt/label/record-print flows don't call window.print() on the main
+    // document at all — they do window.open('', ...), build the printable page with
+    // document.write(), then call .print() on that popup. Android's WebView has no
+    // real multi-window support (onOpenWindow only sniffs a navigation target), and
+    // even when a second WebView existed this injected script never runs inside it
+    // (injectedJavaScriptForMainFrameOnly), so that popup's window.print() silently
+    // hit the unmodified native WebView, which doesn't implement it — nothing opened,
+    // or the dialog flashed and closed because there was no real document behind it.
+    // Fix: only intercept the blank-popup print pattern. A popup given a real URL
+    // (login flows, etc.) still goes through the normal onOpenWindow path untouched.
+    (function() {
+      var __fkOriginalOpen = window.open;
+      window.open = function(url, name, specs) {
+        if (url && url !== '' && url !== 'about:blank') {
+          return __fkOriginalOpen.call(window, url, name, specs);
+        }
+        var __fkHtml = '';
+        var stubDocument = {
+          write: function(html) { __fkHtml += (html == null ? '' : String(html)); },
+          writeln: function(html) { __fkHtml += (html == null ? '' : String(html)) + '\\n'; },
+          open: function() { __fkHtml = ''; return stubDocument; },
+          close: function() { /* no-op: print() below is what actually triggers printing */ },
+          title: ''
+        };
+        var stubWindow = {
+          document: stubDocument,
+          print: function() {
+            window.ReactNativeWebView.postMessage(JSON.stringify({
+              type: 'PRINT_REQUEST',
+              title: stubDocument.title || document.title || '',
+              paperSize: '${printPaperSize}',
+              html: __fkHtml || null
+            }));
+          },
+          close: function() {},
+          focus: function() {},
+          blur: function() {},
+          location: { href: '', replace: function() {}, assign: function() {} }
+        };
+        return stubWindow;
+      };
+    })();
     ` : '// Printing disabled - window.print() not intercepted'}
 
     // Silent Print: window.FreeKiosk.silentPrinter drives the ESC/POS printer with no dialog.
@@ -1053,8 +1096,9 @@ const WebViewComponent = forwardRef<WebViewComponentRef, WebViewComponentProps>(
               .catch((err: any) => console.error('[WebView] TTS getVoices failed:', err));
           }
         } else if (data.type === 'PRINT_REQUEST') {
-          // Handle print request from window.print()
-          PrintModule.printWebView(data.title || 'FreeKiosk Print', data.paperSize || 'A4')
+          // Handle print request from window.print(), or from the window.open()
+          // print-popup shim above (data.html carries the popup's written content).
+          PrintModule.printWebView(data.title || 'FreeKiosk Print', data.paperSize || 'A4', data.html || null)
             .then(() => console.log('[WebView] Print job started'))
             .catch((err: any) => console.error('[WebView] Print failed:', err));
         } else if (data.type === 'FK_PRINTER') {

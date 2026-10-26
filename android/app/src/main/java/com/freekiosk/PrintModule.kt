@@ -10,6 +10,7 @@ import android.print.PrintManager
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -183,13 +184,19 @@ class PrintModule(reactContext: ReactApplicationContext) :
     }
 
     /**
-     * Print the current WebView content
-     * Called from JavaScript when window.print() is intercepted
+     * Print the current WebView content, or arbitrary HTML.
+     * Called from JavaScript when window.print() is intercepted.
      * @param title  Print job name (from document.title)
      * @param paperSize  Paper size identifier: "A4", "A5", "A3", "LETTER", "LEGAL" (default "A4")
+     * @param html  When non-blank, printed directly via a hidden WebView instead of the
+     *   currently-attached kiosk WebView. Covers the window.open('', ...) + document.write()
+     *   + .print() pattern used by many receipt/label/record print flows: that printable
+     *   content was never part of the visible page, so there is nothing to find in the
+     *   activity's view hierarchy for it (see the JS-side window.open shim in
+     *   WebViewComponent.tsx for how this string is captured).
      */
     @ReactMethod
-    fun printWebView(title: String?, paperSize: String?, promise: Promise) {
+    fun printWebView(title: String?, paperSize: String?, html: String?, promise: Promise) {
         val activity = reactApplicationContext.currentActivity
         if (activity == null) {
             DebugLog.errorProduction(NAME, "No activity available for printing")
@@ -199,55 +206,10 @@ class PrintModule(reactContext: ReactApplicationContext) :
 
         try {
             activity.runOnUiThread {
-                try {
-                    // Find WebView in the activity's view hierarchy
-                    val webView = findWebViewRecursive(activity.window.decorView)
-
-                    if (webView == null) {
-                        DebugLog.errorProduction(NAME, "WebView not found in view hierarchy")
-                        promise.reject("NO_WEBVIEW", "WebView not found")
-                        return@runOnUiThread
-                    }
-
-                    // IMPORTANT: PrintManager.print() must be called from an Activity context, not application context
-                    val printManager = activity.getSystemService(Context.PRINT_SERVICE) as PrintManager
-                    val jobName = title?.takeIf { it.isNotBlank() } ?: "FreeKiosk Print"
-
-                    DebugLog.d(NAME, "Starting print job: $jobName for WebView at URL: ${webView.url}")
-
-                    // Claimed before opening the dialog, so a focus change between here
-                    // and holding the job does not leave the window unguarded.
-                    markPrintStarting()
-
-                    // Map paper size string to Android MediaSize constant
-                    val mediaSize = when (paperSize?.uppercase()) {
-                        "A3"     -> PrintAttributes.MediaSize.ISO_A3
-                        "A5"     -> PrintAttributes.MediaSize.ISO_A5
-                        "LETTER" -> PrintAttributes.MediaSize.NA_LETTER
-                        "LEGAL"  -> PrintAttributes.MediaSize.NA_LEGAL
-                        else     -> PrintAttributes.MediaSize.ISO_A4 // default
-                    }
-                    DebugLog.d(NAME, "Print paper size: ${paperSize ?: "A4 (default)"} → $mediaSize")
-
-                    // Create print document adapter from WebView
-                    val printAdapter = webView.createPrintDocumentAdapter(jobName)
-
-                    // Start print job with configured paper size as default
-                    val printAttributes = PrintAttributes.Builder()
-                        .setMediaSize(mediaSize)
-                        .setResolution(PrintAttributes.Resolution("default", "Default", 300, 300))
-                        .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
-                        .build()
-
-                    val job = printManager.print(jobName, printAdapter, printAttributes)
-                    markPrintJob(job)
-
-                    DebugLog.d(NAME, "Print dialog opened successfully")
-                    promise.resolve(true)
-                } catch (e: Exception) {
-                    clearPrintState()
-                    DebugLog.errorProduction(NAME, "Error during print: ${e.message}")
-                    promise.reject("PRINT_ERROR", "Failed to print: ${e.message}", e)
+                if (!html.isNullOrBlank()) {
+                    printHtmlContent(activity, title, paperSize, html, promise)
+                } else {
+                    printAttachedWebView(activity, title, paperSize, promise)
                 }
             }
         } catch (e: Exception) {
@@ -255,6 +217,124 @@ class PrintModule(reactContext: ReactApplicationContext) :
             DebugLog.errorProduction(NAME, "Error initiating print: ${e.message}")
             promise.reject("PRINT_ERROR", "Failed to initiate print: ${e.message}", e)
         }
+    }
+
+    /** Original path: print whatever page is currently shown in the kiosk's WebView. */
+    private fun printAttachedWebView(activity: Activity, title: String?, paperSize: String?, promise: Promise) {
+        try {
+            // Find WebView in the activity's view hierarchy
+            val webView = findWebViewRecursive(activity.window.decorView)
+
+            if (webView == null) {
+                DebugLog.errorProduction(NAME, "WebView not found in view hierarchy")
+                promise.reject("NO_WEBVIEW", "WebView not found")
+                return
+            }
+
+            DebugLog.d(NAME, "Starting print job for WebView at URL: ${webView.url}")
+            startPrintJob(activity, webView, title, paperSize, promise)
+        } catch (e: Exception) {
+            clearPrintState()
+            DebugLog.errorProduction(NAME, "Error during print: ${e.message}")
+            promise.reject("PRINT_ERROR", "Failed to print: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Print path for content that only ever existed as a string (the window.open()
+     * print-popup pattern): load it into a hidden WebView attached off-screen, so it
+     * actually gets a layout pass to print from, then print it and tear it down.
+     */
+    private fun printHtmlContent(activity: Activity, title: String?, paperSize: String?, html: String, promise: Promise) {
+        try {
+            val hiddenWebView = WebView(activity)
+            val decorView = activity.window.decorView as ViewGroup
+            // INVISIBLE (not GONE) so it still gets measured/laid out like a real page —
+            // GONE views are skipped by layout entirely and would print blank/truncated.
+            // Full-size so percentage widths and print CSS compute the same as a visible page.
+            hiddenWebView.layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            hiddenWebView.visibility = View.INVISIBLE
+            decorView.addView(hiddenWebView)
+
+            fun cleanup() {
+                // Printing reads from the adapter's own snapshot once started, so the view
+                // isn't needed by the time this runs; delayed slightly as a safety margin
+                // rather than removed the instant the print job is handed off.
+                hiddenWebView.postDelayed({
+                    decorView.removeView(hiddenWebView)
+                    hiddenWebView.destroy()
+                }, 3000)
+            }
+
+            hiddenWebView.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    try {
+                        startPrintJob(activity, hiddenWebView, title, paperSize, promise)
+                    } catch (e: Exception) {
+                        clearPrintState()
+                        DebugLog.errorProduction(NAME, "Error printing HTML content: ${e.message}")
+                        promise.reject("PRINT_ERROR", "Failed to print: ${e.message}", e)
+                    } finally {
+                        cleanup()
+                    }
+                }
+
+                override fun onReceivedError(view: WebView?, errorCode: Int, description: String?, failingUrl: String?) {
+                    clearPrintState()
+                    DebugLog.errorProduction(NAME, "Hidden WebView failed to load print content: $description")
+                    promise.reject("PRINT_ERROR", "Failed to prepare print content: $description")
+                    cleanup()
+                }
+            }
+
+            // null baseUrl: the written HTML is self-contained (built by the page's own
+            // print-popup script), so there's no origin to resolve relative assets against.
+            hiddenWebView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+        } catch (e: Exception) {
+            clearPrintState()
+            DebugLog.errorProduction(NAME, "Error setting up HTML print: ${e.message}")
+            promise.reject("PRINT_ERROR", "Failed to print: ${e.message}", e)
+        }
+    }
+
+    /** Shared by both print paths: hands a ready WebView to PrintManager. */
+    private fun startPrintJob(activity: Activity, webView: WebView, title: String?, paperSize: String?, promise: Promise) {
+        // IMPORTANT: PrintManager.print() must be called from an Activity context, not application context
+        val printManager = activity.getSystemService(Context.PRINT_SERVICE) as PrintManager
+        val jobName = title?.takeIf { it.isNotBlank() } ?: "FreeKiosk Print"
+
+        // Claimed before opening the dialog, so a focus change between here
+        // and holding the job does not leave the window unguarded.
+        markPrintStarting()
+
+        // Map paper size string to Android MediaSize constant
+        val mediaSize = when (paperSize?.uppercase()) {
+            "A3"     -> PrintAttributes.MediaSize.ISO_A3
+            "A5"     -> PrintAttributes.MediaSize.ISO_A5
+            "LETTER" -> PrintAttributes.MediaSize.NA_LETTER
+            "LEGAL"  -> PrintAttributes.MediaSize.NA_LEGAL
+            else     -> PrintAttributes.MediaSize.ISO_A4 // default
+        }
+        DebugLog.d(NAME, "Print paper size: ${paperSize ?: "A4 (default)"} → $mediaSize")
+
+        // Create print document adapter from WebView
+        val printAdapter = webView.createPrintDocumentAdapter(jobName)
+
+        // Start print job with configured paper size as default
+        val printAttributes = PrintAttributes.Builder()
+            .setMediaSize(mediaSize)
+            .setResolution(PrintAttributes.Resolution("default", "Default", 300, 300))
+            .setMinMargins(PrintAttributes.Margins.NO_MARGINS)
+            .build()
+
+        val job = printManager.print(jobName, printAdapter, printAttributes)
+        markPrintJob(job)
+
+        DebugLog.d(NAME, "Print dialog opened successfully")
+        promise.resolve(true)
     }
 
     /**
